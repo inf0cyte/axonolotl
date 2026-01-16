@@ -38,9 +38,17 @@
 // Service UUID: 0xFE6C (from line 40)
 #define AXON_SERVICE_UUID_16 0xFE6C
 
-// Target OUI for Axon cameras (from line 38)
-// Used for scanning - Axon devices have MAC starting with 00:25:DF
-#define AXON_TARGET_OUI "00:25:DF"
+/*
+ * Axon OUI (Organizationally Unique Identifier)
+ * From MainActivity.kt line 38: TARGET_OUI = "00:25:DF"
+ * Verified against IEEE OUI registry: Axon Enterprise, Inc.
+ * 
+ * This is the MAC address prefix for all Axon devices.
+ * We use this as the first 3 bytes of our transmitter MAC address.
+ */
+#define AXON_OUI_BYTE0 0x00
+#define AXON_OUI_BYTE1 0x25
+#define AXON_OUI_BYTE2 0xDF
 
 // Service data length (from lines 42-46)
 #define AXON_SERVICE_DATA_LEN 24
@@ -53,8 +61,14 @@ static const uint8_t AXON_BASE_SERVICE_DATA[AXON_SERVICE_DATA_LEN] = {
     0xCE, 0x1B, 0x33, 0x00, 0x00, 0x02, 0x00, 0x00   // Bytes 16-23
 };
 
-// Fuzz interval from line 47: FUZZ_INTERVAL_MS = 500L
-#define FUZZ_INTERVAL_MS 500
+/*
+ * Broadcast timing configuration
+ * 
+ * Rate limit: 100ms between transmissions (user requirement)
+ * Pattern: 1 original + 10 fuzzed = 11 transmissions per cycle
+ */
+#define BROADCAST_INTERVAL_MS 100
+#define FUZZ_COUNT_PER_CYCLE 10
 
 /*
  * Fuzz byte positions from updateServiceDataWithFuzz() at lines 303-321:
@@ -72,8 +86,7 @@ static const uint8_t AXON_BASE_SERVICE_DATA[AXON_SERVICE_DATA_LEN] = {
 // Scenes
 typedef enum {
     AxonolotlSceneMenu,
-    AxonolotlSceneTx,
-    AxonolotlSceneFuzz,
+    AxonolotlSceneBroadcast,
     AxonolotlSceneAbout,
     AxonolotlSceneCount,
 } AxonolotlScene;
@@ -87,7 +100,7 @@ typedef enum {
 
 // Custom events
 typedef enum {
-    AxonolotlEventFuzzTick,
+    AxonolotlEventBroadcastTick,
 } AxonolotlEvent;
 
 // Application state
@@ -101,18 +114,20 @@ typedef struct {
     Popup* popup;
     Widget* widget;
     
-    bool is_advertising;
-    bool is_fuzzing;
-    uint16_t fuzz_value;  // 16-bit counter (masked with 0xFFFF in source)
+    bool is_broadcasting;
+    uint8_t cycle_position;     // 0 = original, 1-10 = fuzzed payloads
+    uint32_t total_transmissions;
+    uint16_t current_fuzz_value;
     uint8_t current_data[AXON_SERVICE_DATA_LEN];
     
-    FuriTimer* fuzz_timer;
+    FuriTimer* broadcast_timer;
 } Axonolotl;
 
 // Function declarations
 Axonolotl* axonolotl_alloc(void);
 void axonolotl_free(Axonolotl* app);
 
-bool axonolotl_start_advertising(Axonolotl* app);
-void axonolotl_stop_advertising(Axonolotl* app);
-void axonolotl_update_fuzz_data(Axonolotl* app);
+bool axonolotl_send_single_broadcast(Axonolotl* app);
+void axonolotl_stop_broadcasting(Axonolotl* app);
+void axonolotl_prepare_original_payload(Axonolotl* app);
+void axonolotl_prepare_fuzzed_payload(Axonolotl* app);

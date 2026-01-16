@@ -6,16 +6,21 @@ Broadcasts BLE advertisements using the Axon Signal protocol to trigger Axon bod
 
 ## Features
 
-### Trigger
-Continuously broadcasts the Axon Signal BLE advertisement. Any Axon body camera within range (~5-10m) will be triggered to start recording. Broadcasting continues until you press Back.
+### Broadcast
+Single unified broadcast action that combines trigger and fuzz functionality:
 
-- LED: Green while active
+1. **Sends original payload** - triggers any Axon camera in range
+2. **Sends 10 fuzzed payloads** - attempts to bypass cooldown restriction
+3. **Repeats** until user presses Back
 
-### Fuzz Mode
-Attempts to bypass the trigger cooldown restriction. Once a camera has been triggered, it ignores repeated signals from the same source for a cooldown period. Fuzz mode mutates payload bytes every 500ms in an attempt to make each broadcast appear as a distinct trigger source.
+Each transmission uses a new randomly-generated MAC address with the **Axon OUI prefix (00:25:DF)**, making each broadcast appear to come from a different Axon device.
 
-- LED: Magenta while active
-- Display shows current fuzz value (0x0000 - 0xFFFF)
+- **Rate**: 100ms between transmissions (10 TX/second)
+- **LED**: Green while active
+- **Display**: Shows TX count, mode (ORIGINAL/FUZZED), and current fuzz value
+
+### Why Fuzz?
+Once a camera has been triggered, it ignores repeated signals from the same source for a cooldown period. The fuzz mode mutates payload bytes using random values to bypass this restriction, combined with MAC address rotation to maximize trigger success.
 
 ## Installation
 
@@ -27,26 +32,34 @@ SD Card/apps/Bluetooth/axonolotl.fap
 Or build from source using `ufbt`:
 ```bash
 ufbt build
-ufbt launch
 ```
 
 ## Protocol Details
 
 Derived from `MainActivity.kt` in the original AxonCadabra source:
 
-| Parameter | Value |
-|-----------|-------|
-| Service UUID | 0xFE6C |
-| Service Data | 24 bytes |
-| Axon OUI | 00:25:DF |
-| Fuzz Interval | 500ms |
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| Service UUID | 0xFE6C | Line 40 |
+| Service Data | 24 bytes | Lines 42-46 |
+| Axon OUI | 00:25:DF | Line 38, IEEE Registry |
+| Broadcast Interval | 100ms | User config |
+| Fuzz per cycle | 10 | User config |
 
-Base payload (hex):
+**Base payload (hex):**
 ```
 01583837303032465034010200000000CE1B330000020000
 ```
 
-Fuzz mode mutates bytes at positions 10, 11, 20, and 21.
+**Fuzz mutations** (from `updateServiceDataWithFuzz()` lines 303-321):
+- Byte 10: `(fuzz_value >> 8) & 0xFF`
+- Byte 11: `fuzz_value & 0xFF`
+- Byte 20: `(fuzz_value >> 4) & 0xFF`
+- Byte 21: `(fuzz_value << 4) & 0xFF`
+
+**MAC Address:**
+- Bytes 0-2: Axon OUI (00:25:DF) - constant
+- Bytes 3-5: Random - regenerated each transmission
 
 ## Limitations
 
@@ -60,8 +73,6 @@ axonolotl/
 ├── axonolotl.c         # Main implementation
 ├── axonolotl.h         # Header with protocol constants
 ├── axonolotl.png       # App icon
-└── icons/
-    └── Signal_10x10.png
 ```
 
 ## Credits

