@@ -1,0 +1,14 @@
+App(
+    appid="axonolotl",
+    name="Axonolotl",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="axonolotl_app",
+    requires=["gui", "bt"],
+    stack_size=2 * 1024,
+    fap_icon="axonolotl.png",
+    fap_icon_assets="icons",
+    fap_category="Bluetooth",
+    fap_author="infocyte",
+    fap_version="1.0",
+    fap_description="Axon Signal BLE broadcaster - triggers Axon body cameras",
+)
