@@ -2,7 +2,7 @@
 
 Flipper Zero port of [AxonCadabra](https://github.com/WithLoveFromMinneapolis/AxonCadabra) by withlovefromminneapolis.
 
-Broadcasts BLE advertisements using the Axon Signal protocol to trigger Axon body cameras.
+Broadcasts BLE advertisements using the Axon Signal protocol to trigger Axon body cameras to start recording.
 
 ## Features
 
@@ -24,15 +24,17 @@ Once a camera has been triggered, it ignores repeated signals from the same sour
 
 ## Installation
 
-Copy the `axonolotl` folder to your Flipper Zero's SD card:
+Build from source using `ufbt`:
+```bash
+ufbt build
+```
+
+Copy `axonolotl.fap` to your Flipper Zero's SD card:
 ```
 SD Card/apps/Bluetooth/axonolotl.fap
 ```
 
-Or build from source using `ufbt`:
-```bash
-ufbt build
-```
+Or just use the precompiled axonolotl.fap
 
 ## Protocol Details
 
